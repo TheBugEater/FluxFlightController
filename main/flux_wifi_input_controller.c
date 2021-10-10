@@ -10,6 +10,9 @@
 #define FLUX_WIFI_CONNECT_MAGIC_NUMBER  0x32F8B108
 #define FLUX_WIFI_SEND_BUFFER_SIZE      256
 #define FLUX_WIFI_PING_FREQUENCY        100 // 100ms
+#define FLUX_WIFI_WORK_BUFFER_SIZE      1024
+
+char work_buffer[FLUX_WIFI_WORK_BUFFER_SIZE];
 
 typedef enum
 {
@@ -93,7 +96,15 @@ int     flux_send_udp_message(flux_wifi_input_controller_t* controller, flux_udp
 ////////////////////////////////
 // Activate UDP Listner ////////
 ////////////////////////////////
-void    flux_init_udp_broadcast_server(flux_wifi_input_controller_t* controller)
+void    flux_close_socket(flux_wifi_input_controller_t* controller)
+{
+        shutdown(controller->socket, SHUT_RDWR);
+        close(controller->socket);
+
+        controller->socket = 0;
+}
+
+int    flux_init_socket_on_port(flux_wifi_input_controller_t* controller, int32_t port)
 {
         struct sockaddr_in local_addr = {};
         // Create the Broadcast Socket
@@ -101,11 +112,11 @@ void    flux_init_udp_broadcast_server(flux_wifi_input_controller_t* controller)
         {
                 ESP_LOGE("FluxWiFiInputController", "Socket Creation Error" );
                 controller->status = FLUX_WIFI_ERROR;
-                return;
+                return -1;
         }
 
         local_addr.sin_family = AF_INET;
-        local_addr.sin_port = htons(controller->config.broadcast_port);
+        local_addr.sin_port = htons(port);
         local_addr.sin_addr.s_addr = INADDR_ANY;
 
         if(bind(controller->socket, (struct sockaddr*)&local_addr, sizeof(local_addr)) == -1)
@@ -113,39 +124,42 @@ void    flux_init_udp_broadcast_server(flux_wifi_input_controller_t* controller)
                 
                 ESP_LOGE("FluxWiFiInputController", "Socket Bind Error" );
                 controller->status = FLUX_WIFI_ERROR;
-                return;
+                return -1;
         }
 
         if(fcntl(controller->socket, F_SETFL, O_NONBLOCK) == -1)
         {
                 ESP_LOGE("FluxWiFiInputController", "Error Setting Socket to Non-Block" );
                 controller->status = FLUX_WIFI_ERROR;
-                return;
+                return -1;
         }
 
-        ESP_LOGI("FluxWiFiInputController", "Listening to Broadcasts on Port %d", controller->config.broadcast_port);
-        controller->status = FLUX_WIFI_LISTEN_BROADCAST;
+        return 0;
 }
 
 void    flux_listen_udp_broadcast(flux_wifi_input_controller_t* controller)
 {
-        char recv_buffer[128];
         int recv_size = 0;
         socklen_t addr_len = sizeof(controller->remote_addr);
-        recv_size = recvfrom(controller->socket, recv_buffer, 128, 0, (struct sockaddr*)&controller->remote_addr, &addr_len);
+        recv_size = recvfrom(controller->socket, work_buffer, FLUX_WIFI_WORK_BUFFER_SIZE, 0, (struct sockaddr*)&controller->remote_addr, &addr_len);
         if(recv_size >= (int)sizeof(int))
 
         {
                 int magic_number = 0;
-                flux_deserializeint32(&magic_number, recv_buffer, recv_size);
+                flux_deserializeint32(&magic_number, work_buffer, recv_size);
                 ESP_LOGI("FluxWiFiInputController", "Magic Number : %d == %d", magic_number, FLUX_WIFI_CONNECT_MAGIC_NUMBER);
                 if(magic_number == FLUX_WIFI_CONNECT_MAGIC_NUMBER)
                 {
                         ESP_LOGI("FluxWiFiInputController", "Received a Connection Request from %s", inet_ntoa(controller->remote_addr.sin_addr.s_addr));
-                        controller->status = FLUX_WIFI_CONTROLLER_CONNECTED;
 
-                        // Just change the communication port of the address
-                        controller->remote_addr.sin_port = htons(controller->config.communication_port);
+                        flux_close_socket(controller);
+                        if(flux_init_socket_on_port(controller, controller->config.communication_port) == 0)
+                        {
+                                // Just change the communication port of the address
+                                controller->status = FLUX_WIFI_CONTROLLER_CONNECTED;
+                                controller->remote_addr.sin_port = htons(controller->config.communication_port);
+                        }
+                                
                 }
         }
         else if(recv_size == -1)
@@ -160,6 +174,21 @@ void    flux_listen_udp_broadcast(flux_wifi_input_controller_t* controller)
 
 void    flux_check_incoming_messages(flux_wifi_input_controller_t* controller)
 {
+        int recv_size = 0;
+        socklen_t addr_len = sizeof(controller->remote_addr);
+        recv_size = recvfrom(controller->socket, work_buffer, FLUX_WIFI_WORK_BUFFER_SIZE, 0, (struct sockaddr*)&controller->remote_addr, &addr_len);
+        if(recv_size > (int)sizeof(int32_t))
+        {
+        }
+        else if(recv_size == -1)
+        {
+                if(errno != EWOULDBLOCK)
+                {
+                        ESP_LOGE("FluxWiFiInputController", "Error on Socket %d", errno);
+                        controller->status = FLUX_WIFI_ERROR;
+                }
+        }
+
 }
 
 void    flux_udp_connected(flux_wifi_input_controller_t* controller)
@@ -195,7 +224,12 @@ void    flux_wifi_controller_event_handler(void* arg, esp_event_base_t event_bas
     {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI("FluxWiFiInputController", "Connected: Local IP :" IPSTR, IP2STR(&event->ip_info.ip));
-        flux_init_udp_broadcast_server(controller);
+
+        if(flux_init_socket_on_port(controller, controller->config.broadcast_port) == 0)
+        {
+                ESP_LOGI("FluxWiFiInputController", "Listening to Broadcasts on Port %d", controller->config.broadcast_port);
+                controller->status = FLUX_WIFI_LISTEN_BROADCAST;
+        }
     } 
 }
 
@@ -248,6 +282,16 @@ void    wifi_input_controller_update(void* _this)
         else if(controller->status == FLUX_WIFI_CONTROLLER_CONNECTED)
         {
                 flux_udp_connected(controller);
+        }
+        else if(controller->status == FLUX_WIFI_ERROR)
+        {
+                ESP_LOGI("FluxWiFiInputController", "Restarting Socket");
+                flux_close_socket(controller);
+
+                if(flux_init_socket_on_port(controller, controller->config.broadcast_port) == 0)
+                {
+                        controller->status = FLUX_WIFI_LISTEN_BROADCAST;
+                }
         }
 }
 
